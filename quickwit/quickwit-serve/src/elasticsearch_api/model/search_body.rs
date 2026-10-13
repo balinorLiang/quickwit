@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 
 use quickwit_proto::search::SortOrder;
@@ -61,6 +61,20 @@ struct FieldSortParams {
     pub date_format: Option<ElasticDateFormat>,
 }
 
+/// Elasticsearch-compatible `highlight` clause.
+///
+/// Quickwit only supports a subset of the highlighting options: only the
+/// field names listed in `fields` are taken into account. Snippets are
+/// generated with the default `<em>`/`</em>` tags, just like Elasticsearch's
+/// default highlighting.
+#[derive(Debug, Default, Clone, Deserialize, PartialEq)]
+pub struct Highlight {
+    /// Fields to extract snippets on. The per-field options (e.g.
+    /// `fragment_size`) are accepted but ignored.
+    #[serde(default)]
+    pub fields: BTreeMap<String, serde_json::Value>,
+}
+
 #[derive(Debug, Default, Clone, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct SearchBody {
@@ -90,7 +104,7 @@ pub struct SearchBody {
     #[serde(default)]
     pub script_fields: serde::de::IgnoredAny,
     #[serde(default)]
-    pub highlight: serde::de::IgnoredAny,
+    pub highlight: Option<Highlight>,
     #[serde(default)]
     pub version: serde::de::IgnoredAny,
 }
@@ -278,6 +292,35 @@ mod tests {
         assert_eq!(field_sorts[2].order, SortOrder::Desc);
         assert_eq!(field_sorts[3].field, "_doc");
         assert_eq!(field_sorts[3].order, SortOrder::Asc);
+    }
+
+    #[test]
+    fn test_highlight_parsing() {
+        let json = r#"
+        {
+            "query": {"match_all": {}},
+            "highlight": {
+                "pre_tags": ["<b>"],
+                "post_tags": ["</b>"],
+                "fields": {
+                    "title": {},
+                    "content": {"fragment_size": 150}
+                }
+            }
+        }
+        "#;
+        let search_body: SearchBody = serde_json::from_str(json).unwrap();
+        let highlight = search_body.highlight.unwrap();
+        assert_eq!(highlight.fields.len(), 2);
+        assert!(highlight.fields.contains_key("title"));
+        assert!(highlight.fields.contains_key("content"));
+    }
+
+    #[test]
+    fn test_no_highlight() {
+        let json = r#"{"query": {"match_all": {}}}"#;
+        let search_body: SearchBody = serde_json::from_str(json).unwrap();
+        assert!(search_body.highlight.is_none());
     }
 
     #[test]

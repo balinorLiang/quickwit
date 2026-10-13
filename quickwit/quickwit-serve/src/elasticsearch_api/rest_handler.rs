@@ -566,6 +566,12 @@ fn build_request_for_es_api(
     let has_doc_id_field = sort_fields.iter().any(is_doc_field);
     let search_after = partial_hit_from_search_after_param(search_body.search_after, &sort_fields)?;
 
+    let snippet_fields: Vec<String> = search_body
+        .highlight
+        .as_ref()
+        .map(|highlight| highlight.fields.keys().cloned().collect())
+        .unwrap_or_default();
+
     Ok((
         quickwit_proto::search::SearchRequest {
             index_id_patterns,
@@ -576,7 +582,7 @@ fn build_request_for_es_api(
             sort_fields,
             start_timestamp: None,
             end_timestamp: None,
-            snippet_fields: Vec::new(),
+            snippet_fields,
             scroll_ttl_secs,
             search_after,
             count_hits,
@@ -962,6 +968,15 @@ fn convert_hit(
         }
     }
 
+    // The snippet, when requested via `highlight`, is a JSON object mapping
+    // field names to lists of highlighted fragments, e.g.
+    // `{"title": [], "body": ["foo <em>bar</em> baz"]}`.
+    let highlight: std::collections::BTreeMap<String, Vec<String>> = hit
+        .snippet
+        .as_deref()
+        .and_then(|snippet_json| serde_json::from_str(snippet_json).ok())
+        .unwrap_or_default();
+
     ElasticHit {
         fields: Default::default(),
         explanation: None,
@@ -970,7 +985,7 @@ fn convert_hit(
         score: None,
         nested: None,
         source,
-        highlight: Default::default(),
+        highlight,
         inner_hits: Default::default(),
         matched_queries: Vec::default(),
         sort,
