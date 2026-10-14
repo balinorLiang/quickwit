@@ -147,6 +147,7 @@ fast:
 | `en_stem`     | Like `default`, but also applies stemming on the resulting tokens. Filters out tokens larger than 255 bytes.  |
 | `whitespace`  | Chops the text on according to whitespace only. Doesn't remove long tokens or converts to lowercase. |
 | `chinese_compatible` |  Chop between each CJK character in addition to what `default` does. Should be used with `record: position` to be able to properly search |
+| `chinese_dict` | Segments Chinese text with a dictionary (`jieba`), so that multi-character words such as `天气` form a single token, unlike `chinese_compatible` which splits every CJK character. Long words are also indexed as their sub-words, so that a search for a word still matches when the query and the indexed text are not segmented identically. Tokens that contain neither a letter nor a digit (whitespace, punctuation) are dropped. Should be used with `record: position`. |
 | `lowercase`   | Applies a lowercase transformation on the text. It does not tokenize the text. |
 
 ##### Description of available normalizers
@@ -374,7 +375,7 @@ Stored primitive types are inferred from the JSON value types using the followin
 | `stored`    | Whether value is stored in the document store | `true` |
 | `indexed`   | Whether value is indexed | `true` |
 | `fast`     | Whether value is stored in a fast field. The default behaviour for text in the JSON is to store the text unchanged. A normalizer can be configured via `normalizer: lowercase`. ([See normalizers](#description-of-available-normalizers)) for a list of available normalizers. | `false` |
-| `tokenizer` | **Only affects strings in the json object**. Name of the `Tokenizer`, choices between `raw`, `default`, `en_stem` and `chinese_compatible` | `raw` |
+| `tokenizer` | **Only affects strings in the json object**. Name of the `Tokenizer`. ([See tokenizers](#description-of-available-tokenizers)) for a list of available tokenizers. | `raw` |
 | `record`    | **Only affects strings in the json object**. Describes the amount of information indexed, choices between `basic`, `freq` and `position` | `basic` |
 | `expand_dots`    | If true, json keys containing a `.` should be expanded. For instance, if `expand_dots` is set to true, `{"k8s.node.id": "node-2"}` will be indexed as if it was `{"k8s": {"node": {"id": "node2"}}}`. The benefit is that escaping the `.` will not be required at query time. In other words, `k8s.node.id:node2` will match the document. This does not impact the way the document is stored.  | `true` |
 

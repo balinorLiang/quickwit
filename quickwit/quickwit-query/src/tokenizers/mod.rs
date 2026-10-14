@@ -13,6 +13,7 @@
 // limitations under the License.
 
 mod chinese_compatible;
+mod chinese_dict;
 mod code_tokenizer;
 mod tokenizer_manager;
 mod unicode_segmenter_tokenizer;
@@ -25,6 +26,7 @@ use tantivy::tokenizer::{
 };
 
 use self::chinese_compatible::ChineseTokenizer;
+use self::chinese_dict::ChineseDictTokenizer;
 pub use self::code_tokenizer::CodeTokenizer;
 pub use self::tokenizer_manager::{RAW_TOKENIZER_NAME, TokenizerManager};
 pub use self::unicode_segmenter_tokenizer::UnicodeSegmenterTokenizer;
@@ -64,6 +66,13 @@ pub fn create_default_quickwit_tokenizer_manager() -> TokenizerManager {
         .filter(LowerCaser)
         .build();
     tokenizer_manager.register("chinese_compatible", chinese_tokenizer, true);
+
+    let chinese_dict_tokenizer = TextAnalyzer::builder(ChineseDictTokenizer)
+        .filter(RemoveLongFilter::limit(DEFAULT_REMOVE_TOKEN_LENGTH))
+        .filter(LowerCaser)
+        .build();
+    tokenizer_manager.register("chinese_dict", chinese_dict_tokenizer, true);
+
     tokenizer_manager.register(
         "source_code_default",
         TextAnalyzer::builder(CodeTokenizer::default())
@@ -124,8 +133,23 @@ mod tests {
         tokenizer_manager
             .get_tokenizer("chinese_compatible")
             .unwrap();
+        tokenizer_manager.get_tokenizer("chinese_dict").unwrap();
         tokenizer_manager.get_tokenizer("default").unwrap();
         tokenizer_manager.get_tokenizer("raw").unwrap();
+    }
+
+    #[test]
+    fn test_chinese_dict_is_registered_as_a_lowercaser() {
+        // The registered analyzer must lowercase, like `chinese_compatible`
+        // does, so that the fields using it resolve their normalizer to
+        // `raw_lowercase` (used by wildcard and regex queries).
+        let tokenizer_manager = super::create_default_quickwit_tokenizer_manager();
+        let mut tokenizer = tokenizer_manager.get_tokenizer("chinese_dict").unwrap();
+        let mut stream = tokenizer.token_stream("Hello WORLD");
+        assert!(stream.advance());
+        assert_eq!(stream.token().text, "hello");
+        assert_eq!(stream.token().position, 0);
+        assert!(tokenizer_manager.get_normalizer("chinese_dict").is_some());
     }
 
     #[test]
