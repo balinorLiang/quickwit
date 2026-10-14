@@ -150,6 +150,21 @@ fast:
 | `chinese_dict` | Segments Chinese text with a dictionary (`jieba`), so that multi-character words such as `天气` form a single token, unlike `chinese_compatible` which splits every CJK character. Long words are also indexed as their sub-words, so that a search for a word still matches when the query and the indexed text are not segmented identically. Tokens that contain neither a letter nor a digit (whitespace, punctuation) are dropped. Should be used with `record: position`. |
 | `lowercase`   | Applies a lowercase transformation on the text. It does not tokenize the text. |
 
+:::warning Limitations of `chinese_dict`
+
+`chinese_dict` segments words, so it answers a different set of queries than `chinese_compatible`:
+
+- **Single CJK characters are not searchable.** A long word is kept as one token and is not split back
+  into its characters, so a query for `气` does not match a document containing `今天天气很好`. Query a
+  whole word (`天气`) instead.
+- **Phrases must be written as one word.** `"今天天气"` matches, but `"今天 天气"` does not, because
+  search mode also indexes the sub-words of a long word and those take the positions in between.
+
+Both are inherent to dictionary segmentation rather than defects. Switching the tokenizer of an existing
+index is not possible in place: the tokenizer name is baked into the index metadata and the splits, so the
+index has to be rebuilt.
+:::
+
 ##### Description of available normalizers
 
 | Normalizer     | Description   |

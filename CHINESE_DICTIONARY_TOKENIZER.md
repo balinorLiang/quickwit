@@ -17,7 +17,7 @@ Quickwit 目前对中文的支持是**逐字切分**(内置分词器 `chinese_co
 - 注册后用户即可在索引配置中直接写 `tokenizer: chinese_dict`
 - 索引侧与查询侧自动共享同一个 `TokenizerManager`,分词结果天然一致
 
-**方案可行,但有 3 个必须由评审明确接受的代价**:全节点携带词典、滚动升级时序约束、"必须重建索引且无回滚路径"。
+**方案可行,但有 3 个必须由评审明确接受的代价**:词典的 **32 MiB 常驻内存**(只由"实际用该分词器分过词"的进程支付,见 13.6)、滚动升级时序约束、"必须重建索引且无回滚路径"。
 
 ---
 
@@ -467,7 +467,14 @@ jieba-rs = { workspace = true }
 unknown tokenizer `chinese_dict` for field `body`
 ```
 
-这会导致集群节点行为分裂。因此本方案**无条件注册**(与 `chinese_compatible` 一致),代价是所有服务(含 searcher)都会带上词典数据和相应内存开销。这是本方案最主要的成本,必须在评审时明确接受。
+这会导致集群节点行为分裂。因此本方案**无条件注册**(与 `chinese_compatible` 一致)。
+
+**但"注册"不等于"加载"**(修订):`TextAnalyzer::builder(ChineseDictTokenizer)` 只构造 analyzer,那 32 MiB 的词典要等第一次真正调用 `token_stream` 时才由 `LazyLock` 加载(实测见 13.6)。因此:
+
+- 纯 searcher 加载含 `chinese_dict` 的索引配置时,`validate_fields_tokenizers` 只做名字查表,**不会**触发加载;
+- 只有"实际用该分词器分过词"的进程才支付这 32 MiB。
+
+所以内存成本比初版描述的"所有服务都带上词典"要小。代价是**加载后不可卸载**,且实例不共享(再 new 一个实例额外 +24 MiB)。
 
 > 这也侧面解释了上游为什么最终删掉 `multilang`:任何会影响 schema 解析的 feature gate 都是运维陷阱。
 
@@ -553,16 +560,17 @@ curl -s http://localhost:7280/api/v1/cn-logs/search \
 | 集成测试 | **必须走生产路径**:建索引 → REST `/ingest` 写入 → REST `/search` 查询 → 校验命中、高亮、短语 | `quickwit-integration-tests` |
 | 兼容性测试 | 修改 tokenizer 必须重建索引,验证旧索引不受影响 | 手工/集成 |
 
-**验收必须可判定**(初版只写了"校验命中与高亮",无法判定)。建议的最小验收集:
+**验收必须可判定**(初版只写了"校验命中与高亮",无法判定)。以下验收集**已在真实 REST 链路上跑过**(见第 13.5 节),并据结果修正了初版的两处错误期望:
 
 1. `tokenizer: chinese_dict` + `record: position`,写入 `{"body":"今天天气很好"}`:
-   - 查询 `天气` → **必须命中**
-   - 查询 `"今天 天气"` → **必须命中**(验证位置信息)
-2. 写入 `{"body":"今天很热"}`:
-   - 查询 `"天气"` → **必须不命中**(逐字分词会误命中,这是区分两者的关键用例)
+   - 查询 `天气` → **必须命中** ✅
+   - 查询 `"今天天气"`(整词,无空格)→ **必须命中** ✅
+   - ~~查询 `"今天 天气"` → 必须命中~~ ❌ **初版此条错误**:搜索引擎模式在 `今天` 与 `天气` 之间插入了子词 `天天`(位置 1),索引序列为 `今天`0/`天天`1/`天气`2/`今天天气`3,而带空格的短语查询只会产出 `[今天, 天气]` 两个 token,要求相邻位置因而不成立。**这是 D2 的固有代价,必须记为已知行为**。
+2. 写入 `{"body":"今天很气人"}`(**真正含 `天` 与 `气` 且不相邻**):
+   - 查询 `天气` → **必须不命中该文档** ✅(实测只命中 `今天天气很好`)。这才是区分词典分词与逐字分词的用例;初版写的 `今天很热` 并不含 `气`,逐字分词同样不会命中,没有区分力。
 3. 写入 `{"body":"毕业于中国科学院计算所"}`:
-   - 查询 `中国科学院` → **必须命中**(验证 D2 的子词收益)
-4. 写入含 `，`、`!` 的文本:确认高亮片段不包含标点、且不出现重叠片段
+   - 查询 `中国科学院` → **必须命中**(验证 D2 的子词收益)。单测已覆盖 token 序列连续性;REST 侧未单独跑。
+4. 写入含 `，`、`!` 的文本:确认高亮片段不包含标点、且不出现重叠片段。**未验证**。
 
 > 仓库规范明确:**未经过 HTTP/gRPC 真实链路验证,不得声称功能可用**。单元测试通过不等于功能可用。
 
@@ -613,9 +621,10 @@ make doc
 | **偏移重叠/非单调** | 高亮可能出现重叠或乱序片段 | 实测高亮输出;必要时在流内对偏移做排序/去重,或高亮只取最长区间 |
 | **位置必须单调(硬约束)** | 违反会破坏位置倒排(增量编码) | 保持"枚举序号赋值";在 pin 的 tantivy revision 上确认约束 |
 | **词典覆盖不全** | 专有名词、产品名、错误码被 HMM 兜底切错,召回/精度不稳定 | 二期增加用户自定义词典(第 10 节);先收集真实日志验证切分效果 |
-| **二进制体积与内存** | 词典随所有服务分发(含 searcher) | 已在 4.8 说明,属固有成本;必要时评估按需加载 |
-| **Lambda 冷启动** | `quickwit-lambda-server` 作为 leaf 搜索,首次 `cut` 触发词典加载,放大冷启动 | 度量冷启动增量;必要时预热(与 4.3 的 `LazyLock` 交互需实测) |
-| **分词性能** | `cut_for_search` 本身分配 `Vec<Token>`,代码再 `collect` 一遍;D2 还提高 token 数 | 高吞吐场景改造为惰性迭代器(jieba 提供 `tokenize()`);索引路径上的 CPU 密集任务应走 `quickwit_common` 的 `run_cpu_intensive`(需确认 tokenizer 调用点是否在 tokio worker 上) |
+| **内存与冷启动** | 词典 RSS **32 MiB**(实测),加载 **109 ms**;实例不共享(第二个 +24 MiB) | 只在实际用该分词器分过词的进程里支付(见 4.8、13.6)。压内存需改用 `Jieba::with_dict()` 裁剪词表,代价是分词质量 |
+| **Lambda 冷启动** | `quickwit-lambda-server` 作为 leaf 搜索,首次分词触发 **32 MiB / 109 ms** 的加载,放大冷启动 | 数字见 13.6;注意"注册 ≠ 加载",没查到中文就不付这个成本;必要时预热 |
+| **分词性能** | 实测 **1.79 µs/文档** → 不是瓶颈 | **无需优化**。已实测否决两条看似可行的改动(存 `Token` 代替字节区间、ASCII 快速路径),且 jieba 公开 API 无惰性迭代器(13.6)。索引路径调用点在 `quickwit-indexing/src/actors/indexer.rs:341` |
+| **单字查询漏召** | 长词整体成 token 后不再拆单字,查单字不命中(实测 `气` 查不到 `今天天气很好`) | 在用户文档中写明(4.6、13.7);若要坚持单字召回需索引期额外写入单字 token,与 D2 的初衷冲突 |
 | **依赖 API 变动** | `0.11` 与初版假设的 `0.7` 之间 API/feature 已变 | 锁定 `0.11` 并实测确认签名;用单元测试兜住 |
 | **文档误导** | 官方文档与 `AGENTS.md` 中存在已失效的分词器说明(第 11 节) | 落地时同步修正,并补 4.6 的新增文档 |
 
@@ -632,7 +641,7 @@ make doc
 | 5 | `cut_for_search` 输出顺序与偏移重叠的确切形态 | **已确认**:先子词、后整词;偏移重叠且非单调(如 `服务`0..6 → `务器`3..9 → `服务器`0..9) |
 | 6 | tantivy 对位置单调性的硬性要求 | **已确认须保持单调**。该 pin revision 的 `Token` 为 `{ offset_from: usize, offset_to: usize, position: usize, position_length: usize }`——注意 **`position` 是 `usize` 而非 `u32`** |
 | 7 | 高亮路径在偏移重叠时的输出 | **未做**,需集成测试 |
-| 8 | 词典加载时间与常驻内存 | **部分**:`Jieba::new()` 实测约 **480 ms**;常驻内存未测 |
+| 8 | 词典加载时间与常驻内存 | **已确认**:加载 **109 ms**(release;初版记的 482 ms 是 debug 构建的数字),常驻 **32 MiB**,第二个实例再 +24 MiB(即实例不共享)。详见 13.6 |
 
 ---
 
@@ -691,7 +700,7 @@ make doc
 | 分词器文档表 / JSON `tokenizer` 说明 | `docs/configuration/index-config.md:140-149`、`:377` |
 | `multilang` feature gates 记载位置 | `AGENTS.md:94` |
 
-**验证声明**:本文档 4.3 节的代码已落地为 `quickwit/quickwit-query/src/tokenizers/chinese_dict.rs`,并通过 `cargo test -p quickwit-query --lib`(192 个测试全绿,含 7 个新增用例与 2 个管理器注册用例)。**尚未验证**:高亮在偏移重叠时的行为、词典常驻内存、`--all-features` 全量构建、端到端 REST/gRPC 链路。详见第 9、13 节。
+**验证声明**:本文档 4.3 节的代码已落地为 `quickwit/quickwit-query/src/tokenizers/chinese_dict.rs`,并通过 `cargo test -p quickwit-query --lib`(192 个测试全绿,含 7 个新增用例与 2 个管理器注册用例)。**已手工验证** REST 端到端链路(13.5),**已实测**性能与内存(13.6)。**尚未验证**:高亮在偏移重叠时的行为、`--all-features` 全量构建、自动化集成测试套件。详见第 9、13 节。
 
 ---
 
@@ -734,10 +743,75 @@ make update-licenses                                          → LICENSE-3rdpar
 | `毕业于中国科学院计算所` | `毕业 / 于 / 中国 / 科学 / 学院 / 科学院 / 中国科学院 / 计算 / 计算所` |
 | `你好，世界！code=500 🚀` | `你好 / 世界 / code / 500`(标点、空白、emoji 全部丢弃) |
 | `你好世界` | `你好 / 世界`(对照:`chinese_compatible` 为 `你 / 好 / 世 / 界`) |
+| 单字 `气` | ⚠️ **查不到** `今天天气很好`(token 里只有 `天气`/`今天天气`,没有单字 `气`)。见 13.7 |
 
 ### 13.4 尚未完成
 
 1. **workspace 级** clippy(`cargo clippy --workspace --all-features --tests`)未跑:目前只跑了 `-p quickwit-query --all-targets --all-features`。全量 `--all-features` 构建与 `make test-all`(需 Docker 服务)同样未跑。
-2. 集成测试:`quickwit-integration-tests` 中"建索引 → `/ingest` → `/search` → 校验命中与高亮"的生产链路(第 6 节验收用例 1-4)。**规范要求:未走真实链路不得声称功能可用。**
+2. **自动化**集成测试(`quickwit-integration-tests` 套件)未跑。手工 REST 链路已验证,见 13.5。
 3. 基准测试:`benches/tokenizers_bench.rs` 中量化 D2 带来的 token 数增长与索引膨胀。
-4. 第 11 节的 3 处既有文档不一致(`en_stem` 表行、`AGENTS.md:94` 的 `multilang`、`chinese_compatible` 粒度说明)尚未处理——属既有问题,未纳入本次改动范围。
+4. 高亮在偏移重叠时的输出(第 6 节验收用例 4)未验证。
+5. 第 11 节的 3 处既有文档不一致(`en_stem` 表行、`AGENTS.md:94` 的 `multilang`、`chinese_compatible` 粒度说明)尚未处理——属既有问题,未纳入本次改动范围。
+
+### 13.5 手工 REST 链路验证(2026-10-14)
+
+用源码构建的二进制(`cargo build -p quickwit-cli`,debug)单机启动,走完整生产链路:
+
+```bash
+# 数据目录必须先存在,Quickwit 不会自动创建
+mkdir -p /tmp/qw-run/qwdata && cd /tmp/qw-run
+/opt/quickwit/quickwit/target/debug/quickwit run \
+    --config /opt/quickwit/config/quickwit.yaml -y
+
+# 建索引(tokenizer: chinese_dict)、写入、查询
+curl -XPOST localhost:7280/api/v1/indexes -H 'content-type: application/yaml' \
+     --data-binary @cn-logs.yaml
+curl -XPOST 'localhost:7280/api/v1/cn-logs/ingest?commit=force' \
+     -H 'content-type: application/json' -d '{"body":"今天天气很好"}'
+curl 'localhost:7280/api/v1/cn-logs/search?query=天气'
+```
+
+结果:
+
+| 检查项 | 结果 |
+|---|---|
+| 索引配置含 `tokenizer: chinese_dict` 能否创建 | ✅ 成功,返回的 index config 里 `"tokenizer": "chinese_dict"` |
+| 写入 `今天天气很好` 后查询 `天气` | ✅ `num_hits: 1` |
+| 写入 `今天很气人`(含 `天` 与 `气`,不相邻)后查询 `天气` | ✅ `num_hits: 1`,**只命中 `今天天气很好`**,未误命中 |
+| 短语查询 `"今天天气"` | ✅ `num_hits: 1` |
+| 短语查询 `"今天 天气"`(带空格) | ❌ `num_hits: 0` —— D2 的固有代价,见第 6 节 |
+| ES 兼容 API `GET /api/v1/_elastic/cn-logs/_search?q=天气` | ✅ 命中同一文档 |
+| `GET /openapi.json` | ✅ 200 |
+
+---
+
+### 13.6 实测性能与内存(release 构建)
+
+数字来自 `/tmp/jieba-check`(只依赖 `jieba-rs`,**不含 tantivy 与索引流水线**),4 篇真实中文日志样本,20 000 轮。绝对值不能直接外推到真实索引吞吐,比例关系可用。
+
+| 指标 | 实测值 |
+|---|---|
+| 分词成本(`cut_for_search` + 过滤 + collect) | **1.79 µs/文档**;其中 jieba 本体 1.41 µs → 单核约 **55 万文档/秒** |
+| 精确模式 `cut` 的成本 | 1.08 µs/文档 → 搜索模式比精确模式贵约 **31%** |
+| 词典加载(`Jieba::new()`) | **109 ms**(release);初版记的 482 ms 是 debug 的数字 |
+| 词典常驻内存(RSS 增量) | **32 MiB**;第二个实例再 +24 MiB → **实例各自一份,不共享** |
+| token 膨胀(`cut_for_search` / `cut`) | 1.00×–2.00×(均值约 1.4×) |
+| 标点过滤丢弃比例 | 0%–45%(空格、`=`、`，` 各占一个 token) |
+
+**两个被实测否决的"优化"**(记录在此,后人不必再试):
+
+1. 把 `Vec<(usize, usize)>` 换成 `Vec<jieba_rs::Token>`(想省掉第二次分配)会**更慢**:1.839 vs 1.791 µs/文档 —— 元素从 16 B 变 48 B,移动成本盖过省下的那次分配。**当前"存字节区间"的设计是更优解。**
+2. 给 `is_searchable` 加 ASCII 快速路径会**更慢**:汉字 token 的 ASCII 判定必然失败,还要再跑一遍 `chars()`,整体负收益。
+
+**一处必须纠正的旧结论**:本文档早期版本把"改造为惰性迭代器(jieba 提供 `tokenize()`)"列为性能缓解措施。**这是错的**——`cut` / `cut_for_search` / `tokenize` 在 jieba 0.11 中**全部返回 `Vec`**,公开 API 没有惰性迭代器(`cut_each` 是私有的)。在现有 API 下无法彻底省掉那次分配。
+
+**结论**:分词 CPU 不是瓶颈,热路径没有值得做的优化。真正的成本是 **32 MiB 常驻 + 109 ms 加载**,以及下面这条召回缺口。
+
+### 13.7 已知召回缺口:单字查询
+
+`今天天气很好` 索引出的 token 是 `今天 / 天天 / 天气 / 今天天气 / 很 / 好`,**其中没有单字 `气`**。因此:
+
+- 查询 `气`(单字)→ **不命中**;`chinese_compatible` 下会命中
+- 查询 `天气`(整词)→ 命中
+
+这是词典分词的必然代价:长词整体成 token 后就不再拆回单字。**对"在日志里搜单个汉字"的用户是可见的召回下降**,已在 `docs/configuration/index-config.md` 的 `chinese_dict` 说明中向用户写明。
